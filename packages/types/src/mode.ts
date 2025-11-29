@@ -137,15 +137,14 @@ export type CustomSupportPrompts = z.infer<typeof customSupportPromptsSchema>
 export const DEFAULT_MODES: readonly ModeConfig[] = [
 	{
 		slug: "no-mode",
-		// kilocode_change start
 		name: "No Agent Mode",
 		iconName: "codicon-empty-window",
-		// kilocode_change end
-		roleDefinition: "",
 		description: "No Agent context (reduces token consumption)",
-		whenToUse: "",
-		groups: ["read", ["edit", { fileRegex: "", description: "" }], "browser", "mcp"],
-		customInstructions: "",
+		roleDefinition:
+			"You are Kilo Code, a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.",
+		whenToUse:
+			"Use this mode when you need to write, modify, or refactor code. Ideal for implementing features, fixing bugs, creating new files, or making code improvements across any programming language or framework.",
+		groups: ["read", "edit", "browser", "command", "mcp"],
 	},
 	{
 		slug: "architect",

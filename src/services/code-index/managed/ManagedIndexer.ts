@@ -110,13 +110,12 @@ export class ManagedIndexer implements vscode.Disposable {
 		return !!this.config?.gptChatByApiKey
 	}
 
-	sendEnabledStateToWebview() {
-		const isEnabled = this.isEnabled()
+	sendEnabledStateToWebview(isEnable?: boolean) {
 		ClineProvider.getInstance().then((provider) => {
 			if (provider) {
 				provider.postMessageToWebview({
 					type: "managedIndexerEnabled",
-					managedIndexerEnabled: isEnabled,
+					managedIndexerEnabled: isEnable ?? true,
 				})
 			}
 		})
@@ -145,7 +144,7 @@ export class ManagedIndexer implements vscode.Disposable {
 		await this.fetchConfig()
 
 		const isEnabled = this.isEnabled()
-		this.sendEnabledStateToWebview()
+		this.sendEnabledStateToWebview(isEnabled)
 		if (!isEnabled) {
 			return
 		}
