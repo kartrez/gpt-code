@@ -184,6 +184,10 @@ export const SYSTEM_PROMPT = async (
 	const mode =
 		getModeBySlug(inputMode, customModes)?.slug || modes.find((m) => m.slug === inputMode)?.slug || defaultModeSlug // kilocode_change: don't try to use non-existent modes
 
+	if (mode === 'no-mode') {
+		return ''
+	}
+
 	// Try to load custom system prompt from file
 	const variablesForPrompt: PromptVariables = {
 		workspace: cwd,

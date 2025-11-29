@@ -136,6 +136,18 @@ export type CustomSupportPrompts = z.infer<typeof customSupportPromptsSchema>
 
 export const DEFAULT_MODES: readonly ModeConfig[] = [
 	{
+		slug: "no-mode",
+		// kilocode_change start
+		name: "No Mode",
+		iconName: "codicon-empty-window",
+		// kilocode_change end
+		roleDefinition: "",
+		description: "No system context (reduces token consumption)",
+		whenToUse: "",
+		groups: ["read", ["edit", { fileRegex: "", description: "" }], "browser", "mcp"],
+		customInstructions: "",
+	},
+	{
 		slug: "architect",
 		// kilocode_change start
 		name: "Architect",
