@@ -633,11 +633,7 @@ export class ManagedIndexer implements vscode.Disposable {
 					{
 						query,
 						projectId: state.projectId,
-						preferBranch: state.gitBranch,
-						fallbackBranch: "main",
-						// TODO: Exclude deleted files for the branch
 						excludeFiles: [],
-						path: directoryPrefix,
 					},
 					gptChatByApiKey,
 				)

@@ -179,7 +179,6 @@ export interface ExtensionMessage {
 		| "taskMetadataSaved" // kilocode_change: File save event for task metadata
 		| "managedIndexerState" // kilocode_change
 		| "singleCompletionResult" // kilocode_change
-		| "managedIndexerState" // kilocode_change
 		| "managedIndexerEnabled" // kilocode_change
 	text?: string
 	// kilocode_change start
