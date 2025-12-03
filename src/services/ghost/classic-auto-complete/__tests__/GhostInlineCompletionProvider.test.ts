@@ -139,6 +139,111 @@ describe("findMatchingSuggestion", () => {
 		})
 	})
 
+	describe("backward deletion support", () => {
+		it("should return deleted prefix portion plus suggestion when user backspaces", () => {
+			const suggestions: FillInAtCursorSuggestion[] = [
+				{
+					text: "henk",
+					prefix: "foo",
+					suffix: "bar",
+				},
+			]
+
+			// User backspaced from "foo" to "f"
+			const result = findMatchingSuggestion("f", "bar", suggestions)
+			expect(result).toBe("oohenk")
+		})
+
+		it("should return full prefix plus suggestion when user deletes entire prefix", () => {
+			const suggestions: FillInAtCursorSuggestion[] = [
+				{
+					text: "world",
+					prefix: "hello",
+					suffix: "!",
+				},
+			]
+
+			// User deleted entire prefix
+			const result = findMatchingSuggestion("", "!", suggestions)
+			expect(result).toBe("helloworld")
+		})
+
+		it("should return null when suffix does not match during backward deletion", () => {
+			const suggestions: FillInAtCursorSuggestion[] = [
+				{
+					text: "henk",
+					prefix: "foo",
+					suffix: "bar",
+				},
+			]
+
+			// User backspaced but suffix changed
+			const result = findMatchingSuggestion("f", "baz", suggestions)
+			expect(result).toBeNull()
+		})
+
+		it("should return null when current prefix is not a prefix of stored prefix", () => {
+			const suggestions: FillInAtCursorSuggestion[] = [
+				{
+					text: "henk",
+					prefix: "foo",
+					suffix: "bar",
+				},
+			]
+
+			// Current prefix "x" is not a prefix of "foo"
+			const result = findMatchingSuggestion("x", "bar", suggestions)
+			expect(result).toBeNull()
+		})
+
+		it("should handle backward deletion with empty suggestion text", () => {
+			const suggestions: FillInAtCursorSuggestion[] = [
+				{
+					text: "",
+					prefix: "foo",
+					suffix: "bar",
+				},
+			]
+
+			// User backspaced - should return just the deleted portion
+			const result = findMatchingSuggestion("f", "bar", suggestions)
+			expect(result).toBe("oo")
+		})
+
+		it("should prefer exact match over backward deletion match", () => {
+			const suggestions: FillInAtCursorSuggestion[] = [
+				{
+					text: "henk",
+					prefix: "foo",
+					suffix: "bar",
+				},
+				{
+					text: "exact",
+					prefix: "f",
+					suffix: "bar",
+				},
+			]
+
+			// Should match the exact prefix "f" first (most recent)
+			const result = findMatchingSuggestion("f", "bar", suggestions)
+			expect(result).toBe("exact")
+		})
+
+		it("should handle multi-character backward deletion", () => {
+			const suggestions: FillInAtCursorSuggestion[] = [
+				{
+					text: "test()",
+					prefix: "function myFunc",
+					suffix: " { }",
+				},
+			]
+
+			// User deleted "unc" from "function myFunc"
+			const result = findMatchingSuggestion("function myF", " { }", suggestions)
+			expect(result).toBe("unctest()")
+		})
+	})
+
 	describe("partial typing support", () => {
 		it("should return remaining suggestion when user has partially typed", () => {
 			const suggestions: FillInAtCursorSuggestion[] = [
@@ -347,6 +452,7 @@ describe("GhostInlineCompletionProvider", () => {
 	let mockClineProvider: { cwd: string }
 
 	// Helper to call provideInlineCompletionItems and advance timers
+	// With leading edge debounce, first call executes immediately, subsequent calls wait for 300ms of inactivity
 	async function provideWithDebounce(
 		doc: vscode.TextDocument,
 		pos: vscode.Position,
@@ -354,7 +460,7 @@ describe("GhostInlineCompletionProvider", () => {
 		token: vscode.CancellationToken,
 	) {
 		const promise = provider.provideInlineCompletionItems(doc, pos, ctx, token)
-		await vi.advanceTimersByTimeAsync(300) // Advance past debounce delay
+		await vi.advanceTimersByTimeAsync(300) // Advance past debounce delay for any pending calls
 		return promise
 	}
 
@@ -939,11 +1045,14 @@ describe("GhostInlineCompletionProvider", () => {
 		})
 
 		describe("dispose", () => {
-			it("should clear pending debounce timer when disposed", () => {
-				// Start a debounced fetch (don't await it)
+			it("should clear pending debounce timer when disposed", async () => {
+				// First call executes immediately (leading edge)
+				await provider.provideInlineCompletionItems(mockDocument, mockPosition, mockContext, mockToken)
+
+				// Second call should set a debounce timer
 				provider.provideInlineCompletionItems(mockDocument, mockPosition, mockContext, mockToken)
 
-				// Verify timer is set
+				// Verify timer is set for trailing edge
 				const timerCountBeforeDispose = vi.getTimerCount()
 				expect(timerCountBeforeDispose).toBeGreaterThan(0)
 
@@ -1440,6 +1549,289 @@ describe("GhostInlineCompletionProvider", () => {
 			// Should return the completion because untitled documents are always allowed
 			expect(result).toHaveLength(1)
 			expect(result[0].insertText).toBe("console.log('test');")
+		})
+	})
+
+	describe("pending request reuse", () => {
+		it("should reuse pending request when user types forward (prefix extends, suffix unchanged)", async () => {
+			// Mock the model to track call count
+			let callCount = 0
+			vi.mocked(mockModel.generateResponse).mockImplementation(async (_sys, _user, onChunk) => {
+				callCount++
+				if (onChunk) {
+					onChunk({ type: "text", text: "<COMPLETION>" })
+					onChunk({ type: "text", text: "console.log('test');" })
+					onChunk({ type: "text", text: "</COMPLETION>" })
+				}
+				return {
+					cost: 0.01,
+					inputTokens: 100,
+					outputTokens: 50,
+					cacheWriteTokens: 0,
+					cacheReadTokens: 0,
+				}
+			})
+
+			// First request: user at "const x = 1"
+			const doc1 = new MockTextDocument(vscode.Uri.file("/test.ts"), "const x = 1\nconst y = 2")
+			const pos1 = new vscode.Position(0, 11) // After "const x = 1"
+
+			// Start first request but don't await it yet
+			const promise1 = provider.provideInlineCompletionItems(doc1, pos1, mockContext, mockToken)
+
+			// Advance time partially (not past debounce)
+			await vi.advanceTimersByTimeAsync(100)
+
+			// Second request: user typed "c" - prefix extended, suffix unchanged
+			const doc2 = new MockTextDocument(vscode.Uri.file("/test.ts"), "const x = 1c\nconst y = 2")
+			const pos2 = new vscode.Position(0, 12) // After "const x = 1c"
+
+			// Start second request
+			const promise2 = provider.provideInlineCompletionItems(doc2, pos2, mockContext, mockToken)
+
+			// Advance time past debounce to let requests complete
+			await vi.advanceTimersByTimeAsync(500)
+
+			// Wait for both promises
+			await promise1
+			await promise2
+
+			// The model should only have been called once because the second request
+			// should have reused the pending request from the first
+			expect(callCount).toBe(1)
+		})
+
+		it("should NOT reuse pending request when suffix changes", async () => {
+			// Mock the model to track call count
+			let callCount = 0
+			vi.mocked(mockModel.generateResponse).mockImplementation(async (_sys, _user, onChunk) => {
+				callCount++
+				if (onChunk) {
+					onChunk({ type: "text", text: "<COMPLETION>" })
+					onChunk({ type: "text", text: "console.log('test');" })
+					onChunk({ type: "text", text: "</COMPLETION>" })
+				}
+				return {
+					cost: 0.01,
+					inputTokens: 100,
+					outputTokens: 50,
+					cacheWriteTokens: 0,
+					cacheReadTokens: 0,
+				}
+			})
+
+			// First request: user at "const x = 1"
+			const doc1 = new MockTextDocument(vscode.Uri.file("/test.ts"), "const x = 1\nconst y = 2")
+			const pos1 = new vscode.Position(0, 11)
+
+			// Start first request - with leading edge, this executes immediately
+			await provider.provideInlineCompletionItems(doc1, pos1, mockContext, mockToken)
+			expect(callCount).toBe(1) // First call executed immediately (leading edge)
+
+			// Second request: suffix changed (different text after cursor)
+			// This cannot reuse the first request because suffix changed
+			const doc2 = new MockTextDocument(vscode.Uri.file("/test.ts"), "const x = 1\nconst z = 3")
+			const pos2 = new vscode.Position(0, 11)
+
+			// Start second request - this will be debounced (not leading edge anymore)
+			const promise2 = provider.provideInlineCompletionItems(doc2, pos2, mockContext, mockToken)
+
+			// Should not have called yet (debounced)
+			expect(callCount).toBe(1)
+
+			// Advance time past debounce to let the second request complete
+			await vi.advanceTimersByTimeAsync(300)
+			await promise2
+
+			// The model should have been called twice:
+			// 1. First request executed immediately (leading edge)
+			// 2. Second request executed after debounce (different suffix, couldn't reuse)
+			// The key point is that the second request was NOT reused from the first
+			// because the suffix changed - it started a new debounce cycle
+			expect(callCount).toBe(2)
+		})
+
+		it("should NOT reuse pending request when user backspaces (prefix shrinks)", async () => {
+			// Mock the model to track call count
+			let callCount = 0
+			vi.mocked(mockModel.generateResponse).mockImplementation(async (_sys, _user, onChunk) => {
+				callCount++
+				if (onChunk) {
+					onChunk({ type: "text", text: "<COMPLETION>" })
+					onChunk({ type: "text", text: "console.log('test');" })
+					onChunk({ type: "text", text: "</COMPLETION>" })
+				}
+				return {
+					cost: 0.01,
+					inputTokens: 100,
+					outputTokens: 50,
+					cacheWriteTokens: 0,
+					cacheReadTokens: 0,
+				}
+			})
+
+			// First request: user at "const x = 1"
+			const doc1 = new MockTextDocument(vscode.Uri.file("/test.ts"), "const x = 1\nconst y = 2")
+			const pos1 = new vscode.Position(0, 11)
+
+			// Start first request (don't await - it will be cancelled by the second request)
+			provider.provideInlineCompletionItems(doc1, pos1, mockContext, mockToken)
+
+			// Advance time partially (not past debounce)
+			await vi.advanceTimersByTimeAsync(100)
+
+			// Second request: user backspaced - prefix is now shorter
+			// This will cancel the first request's debounce timer and start a new one
+			const doc2 = new MockTextDocument(vscode.Uri.file("/test.ts"), "const x = \nconst y = 2")
+			const pos2 = new vscode.Position(0, 10) // After "const x = "
+
+			// Start second request
+			const promise2 = provider.provideInlineCompletionItems(doc2, pos2, mockContext, mockToken)
+
+			// Advance time past debounce to let the second request complete
+			await vi.advanceTimersByTimeAsync(500)
+
+			await promise2
+
+			// The model should have been called once (only the second request fires,
+			// the first was cancelled by the debounce)
+			// But the key point is that the second request was NOT reused from the first
+			// because the prefix shrunk - it started a new debounce cycle
+			expect(callCount).toBe(1)
+		})
+	})
+
+	describe("debounce with leading edge behavior", () => {
+		it("should execute immediately on first call (leading edge)", async () => {
+			vi.mocked(mockModel.generateResponse).mockResolvedValue({
+				cost: 0.01,
+				inputTokens: 100,
+				outputTokens: 50,
+				cacheWriteTokens: 0,
+				cacheReadTokens: 0,
+			})
+
+			// First call should execute immediately without waiting
+			const promise = provider.provideInlineCompletionItems(mockDocument, mockPosition, mockContext, mockToken)
+
+			// Model should be called immediately (no timer needed)
+			await promise
+			expect(mockModel.generateResponse).toHaveBeenCalledTimes(1)
+		})
+
+		it("should debounce subsequent calls (wait for 300ms of inactivity)", async () => {
+			let callCount = 0
+			vi.mocked(mockModel.generateResponse).mockImplementation(async () => {
+				callCount++
+				return {
+					cost: 0.01,
+					inputTokens: 100,
+					outputTokens: 50,
+					cacheWriteTokens: 0,
+					cacheReadTokens: 0,
+				}
+			})
+
+			// First call - executes immediately (leading edge)
+			await provider.provideInlineCompletionItems(mockDocument, mockPosition, mockContext, mockToken)
+			expect(callCount).toBe(1)
+
+			// Second call immediately after - should be debounced
+			const mockDocument2 = new MockTextDocument(vscode.Uri.file("/test2.ts"), "const a = 1\nconst b = 2")
+			const mockPosition2 = new vscode.Position(0, 11)
+			const promise2 = provider.provideInlineCompletionItems(mockDocument2, mockPosition2, mockContext, mockToken)
+
+			// Should not have called yet (debounced)
+			expect(callCount).toBe(1)
+
+			// Advance time past debounce delay
+			await vi.advanceTimersByTimeAsync(300)
+			await promise2
+
+			// Now it should have been called
+			expect(callCount).toBe(2)
+		})
+
+		it("should reset debounce timer on each call (only execute after 300ms of inactivity)", async () => {
+			let callCount = 0
+			vi.mocked(mockModel.generateResponse).mockImplementation(async () => {
+				callCount++
+				return {
+					cost: 0.01,
+					inputTokens: 100,
+					outputTokens: 50,
+					cacheWriteTokens: 0,
+					cacheReadTokens: 0,
+				}
+			})
+
+			// First call - executes immediately (leading edge)
+			await provider.provideInlineCompletionItems(mockDocument, mockPosition, mockContext, mockToken)
+			expect(callCount).toBe(1)
+
+			// Multiple rapid calls - each resets the debounce timer
+			const mockDocument2 = new MockTextDocument(vscode.Uri.file("/test2.ts"), "const a = 1\nconst b = 2")
+			const mockPosition2 = new vscode.Position(0, 11)
+
+			const mockDocument3 = new MockTextDocument(vscode.Uri.file("/test3.ts"), "const c = 1\nconst d = 2")
+			const mockPosition3 = new vscode.Position(0, 11)
+
+			// First debounced call
+			provider.provideInlineCompletionItems(mockDocument2, mockPosition2, mockContext, mockToken)
+			expect(callCount).toBe(1)
+
+			// Advance 150ms (half the debounce time)
+			await vi.advanceTimersByTimeAsync(150)
+			expect(callCount).toBe(1)
+
+			// Second debounced call - resets the timer
+			const promise3 = provider.provideInlineCompletionItems(mockDocument3, mockPosition3, mockContext, mockToken)
+			expect(callCount).toBe(1)
+
+			// Advance another 150ms (total 300ms from first debounced call, but only 150ms from second)
+			await vi.advanceTimersByTimeAsync(150)
+			expect(callCount).toBe(1) // Still not called because timer was reset
+
+			// Advance remaining 150ms to complete the debounce from the last call
+			await vi.advanceTimersByTimeAsync(150)
+			await promise3
+			expect(callCount).toBe(2) // Now it should be called
+		})
+
+		it("should allow immediate execution after debounce completes (new leading edge)", async () => {
+			let callCount = 0
+			vi.mocked(mockModel.generateResponse).mockImplementation(async () => {
+				callCount++
+				return {
+					cost: 0.01,
+					inputTokens: 100,
+					outputTokens: 50,
+					cacheWriteTokens: 0,
+					cacheReadTokens: 0,
+				}
+			})
+
+			// First call - executes immediately (leading edge)
+			await provider.provideInlineCompletionItems(mockDocument, mockPosition, mockContext, mockToken)
+			expect(callCount).toBe(1)
+
+			// Second call - debounced
+			const mockDocument2 = new MockTextDocument(vscode.Uri.file("/test2.ts"), "const a = 1\nconst b = 2")
+			const mockPosition2 = new vscode.Position(0, 11)
+			const promise2 = provider.provideInlineCompletionItems(mockDocument2, mockPosition2, mockContext, mockToken)
+
+			// Wait for debounce to complete
+			await vi.advanceTimersByTimeAsync(300)
+			await promise2
+			expect(callCount).toBe(2)
+
+			// Third call after debounce completed - should execute immediately (new leading edge)
+			const mockDocument3 = new MockTextDocument(vscode.Uri.file("/test3.ts"), "const c = 1\nconst d = 2")
+			const mockPosition3 = new vscode.Position(0, 11)
+			await provider.provideInlineCompletionItems(mockDocument3, mockPosition3, mockContext, mockToken)
+
+			// Should have executed immediately without waiting
+			expect(callCount).toBe(3)
 		})
 	})
 })

@@ -61,6 +61,16 @@ export function findMatchingSuggestion(
 				return fillInAtCursor.text.substring(typedContent.length)
 			}
 		}
+
+		// Check for backward deletion: user deleted characters from the end of the prefix
+		// The stored prefix should start with the current prefix (current is shorter)
+		if (fillInAtCursor.prefix.startsWith(prefix) && suffix === fillInAtCursor.suffix) {
+			// Extract the deleted portion of the prefix
+			const deletedContent = fillInAtCursor.prefix.substring(prefix.length)
+
+			// Return the deleted portion plus the original suggestion text
+			return deletedContent + fillInAtCursor.text
+		}
 	}
 
 	return null
@@ -87,8 +97,23 @@ export interface LLMRetrievalResult {
 	cacheReadTokens: number
 }
 
+/**
+ * Represents a pending/in-flight request that can be reused if the user
+ * continues typing in a way that's compatible with the pending completion.
+ */
+interface PendingRequest {
+	/** The prefix that was used to start this request */
+	prefix: string
+	/** The suffix that was used to start this request */
+	suffix: string
+	/** Promise that resolves when the request completes */
+	promise: Promise<void>
+}
+
 export class GhostInlineCompletionProvider implements vscode.InlineCompletionItemProvider {
 	private suggestionsHistory: FillInAtCursorSuggestion[] = []
+	/** Tracks all pending/in-flight requests */
+	private pendingRequests: PendingRequest[] = []
 	private holeFiller: HoleFiller
 	private fimPromptBuilder: FimPromptBuilder
 	private model: GhostModel
@@ -97,6 +122,7 @@ export class GhostInlineCompletionProvider implements vscode.InlineCompletionIte
 	private recentlyVisitedRangesService: RecentlyVisitedRangesService
 	private recentlyEditedTracker: RecentlyEditedTracker
 	private debounceTimer: NodeJS.Timeout | null = null
+	private isFirstCall: boolean = true
 	private ignoreController?: Promise<RooIgnoreController>
 
 	constructor(
@@ -296,18 +322,91 @@ export class GhostInlineCompletionProvider implements vscode.InlineCompletionIte
 		}
 	}
 
+	/**
+	 * Find a pending request that covers the current prefix/suffix.
+	 * A request covers the current position if:
+	 * 1. The suffix matches (user hasn't changed text after cursor)
+	 * 2. The current prefix either equals or extends the pending prefix
+	 *    (user is typing forward, not backspacing or editing earlier)
+	 *
+	 * @returns The covering pending request, or null if none found
+	 */
+	private findCoveringPendingRequest(prefix: string, suffix: string): PendingRequest | null {
+		for (const pendingRequest of this.pendingRequests) {
+			// Suffix must match exactly (text after cursor unchanged)
+			if (suffix !== pendingRequest.suffix) {
+				continue
+			}
+
+			// Current prefix must start with the pending prefix (user typed more)
+			// or be exactly equal (same position)
+			if (prefix.startsWith(pendingRequest.prefix)) {
+				return pendingRequest
+			}
+		}
+		return null
+	}
+
+	/**
+	 * Remove a pending request from the list when it completes.
+	 */
+	private removePendingRequest(request: PendingRequest): void {
+		const index = this.pendingRequests.indexOf(request)
+		if (index !== -1) {
+			this.pendingRequests.splice(index, 1)
+		}
+	}
+
+	/**
+	 * Debounced fetch with leading edge execution and pending request reuse.
+	 * - First call executes immediately (leading edge)
+	 * - Subsequent calls reset the timer and wait for DEBOUNCE_DELAY_MS of inactivity (trailing edge)
+	 * - If a pending request covers the current prefix/suffix, reuse it instead of starting a new one
+	 */
 	private debouncedFetchAndCacheSuggestion(prompt: GhostPrompt, prefix: string, suffix: string): Promise<void> {
+		// Check if any existing pending request covers this one
+		const coveringRequest = this.findCoveringPendingRequest(prefix, suffix)
+		if (coveringRequest) {
+			// Wait for the existing request to complete - no need to start a new one
+			return coveringRequest.promise
+		}
+
+		// If this is the first call (no pending debounce), execute immediately
+		if (this.isFirstCall && this.debounceTimer === null) {
+			this.isFirstCall = false
+			return this.fetchAndCacheSuggestion(prompt, prefix, suffix)
+		}
+
+		// Clear any existing timer (reset the debounce)
 		if (this.debounceTimer !== null) {
 			clearTimeout(this.debounceTimer)
 		}
 
-		return new Promise<void>((resolve) => {
+		// Create the pending request object first so we can reference it in the cleanup
+		const pendingRequest: PendingRequest = {
+			prefix,
+			suffix,
+			promise: null!, // Will be set immediately below
+		}
+
+		const requestPromise = new Promise<void>((resolve) => {
 			this.debounceTimer = setTimeout(async () => {
 				this.debounceTimer = null
+				this.isFirstCall = true // Reset for next sequence
 				await this.fetchAndCacheSuggestion(prompt, prefix, suffix)
+				// Remove this request from pending when done
+				this.removePendingRequest(pendingRequest)
 				resolve()
 			}, DEBOUNCE_DELAY_MS)
 		})
+
+		// Complete the pending request object
+		pendingRequest.promise = requestPromise
+
+		// Add to the list of pending requests
+		this.pendingRequests.push(pendingRequest)
+
+		return requestPromise
 	}
 
 	private async fetchAndCacheSuggestion(prompt: GhostPrompt, prefix: string, suffix: string): Promise<void> {
