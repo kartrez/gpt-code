@@ -20,6 +20,8 @@ import { ICodeParser } from "../interfaces"
 import { CodeParser } from "../processors"
 import { ContextProxy } from "../../../core/config/ContextProxy"
 import { ProfileData } from "../../../shared/WebviewMessage"
+import { TelemetryService } from "@roo-code/telemetry"
+import { TelemetryEventName } from "@roo-code/types"
 
 interface ManagedIndexerConfig {
 	gptChatByApiKey: string | null,
@@ -67,7 +69,13 @@ export class ManagedIndexer implements vscode.Disposable {
 	static prevInstance: ManagedIndexer | null = null
 	static getInstance(): ManagedIndexer {
 		if (!ManagedIndexer.prevInstance) {
-			throw new Error("[ManagedIndexer.getInstance()] no available instance")
+			// NOTE: (brianc) - This _should_ never happen. The ManagedIndexer is instantiated on extension startup
+			// and a reference stays around forever, however, we've seen weird hard to reproduce issue where on occassion
+			// it IS null here. To mitigate that, we'll just create a new instance if needed. This dummy instance will
+			// be disabled and not respond as 'start' will never be called on it, but it wont blow up the extension.
+			console.warn("[ManagedIndexer] Warning: Previous ManagedIndexer instance was null, creating new instance")
+			TelemetryService.instance.captureEvent(TelemetryEventName.MISSING_MANAGED_INDEXER)
+			ManagedIndexer.prevInstance = new ManagedIndexer()
 		}
 
 		return ManagedIndexer.prevInstance
@@ -76,7 +84,7 @@ export class ManagedIndexer implements vscode.Disposable {
 	// Handle changes to vscode workspace folder changes
 	workspaceFoldersListener: vscode.Disposable | null = null
 	// kilocode_change: Listen to configuration changes from ContextProxy
-	configChangeListener: vscode.Disposable | null = null
+	configChangeListener: vscode.Disposable | undefined | null = null
 	config: ManagedIndexerConfig | null = null
 	profile: ProfileData | null = null
 	isActive = false
@@ -88,7 +96,7 @@ export class ManagedIndexer implements vscode.Disposable {
 
 	private readonly codeParser: ICodeParser = new CodeParser()
 
-	constructor(public context: ContextProxy) {
+	constructor(public contextProxy?: ContextProxy | null) {
 		ManagedIndexer.prevInstance = this
 	}
 
@@ -104,13 +112,13 @@ export class ManagedIndexer implements vscode.Disposable {
 	}
 
 	async fetchConfig(): Promise<ManagedIndexerConfig> {
-		const gptChatByApiKey = this.context.getSecret("gptChatByApiKey")
-		const gptChatEnableLocalIndexing = this.context.getValue("gptChatEnableLocalIndexing")
+		const gptChatByApiKey = this.contextProxy?.getSecret("gptChatByApiKey")
+		const gptChatEnableLocalIndexing = this.contextProxy?.getValue("gptChatEnableLocalIndexing")
 		this.profile = await getProfile(gptChatByApiKey)
-		this.context.setValue("gptChatProfileHasSubscription", this.profile.hasSubscription)
+		this.contextProxy?.setValue("gptChatProfileHasSubscription", this.profile.hasSubscription)
 		if (!this.profile.hasSubscription) {
-			this.context.setValue("apiProvider", "gpt-chat-by")
-			this.context.setValue("apiModelId", "coder-flash")
+			this.contextProxy?.setValue("apiProvider", "gpt-chat-by")
+			this.contextProxy?.setValue("apiModelId", "coder-flash")
 		}
 
 
@@ -179,7 +187,7 @@ export class ManagedIndexer implements vscode.Disposable {
 	async start() {
 		console.log("[ManagedIndexer] Starting ManagedIndexer")
 
-		this.configChangeListener = this.context.onManagedIndexerConfigChange(
+		this.configChangeListener = this.context?.onManagedIndexerConfigChange(
 			this.onConfigurationChange.bind(this),
 		)
 
@@ -192,9 +200,9 @@ export class ManagedIndexer implements vscode.Disposable {
 		}
 		await this.fetchConfig()
 
-		const isEnabled = this.isEnabled()
 		this.sendStateToWebview()
-		if (!isEnabled) {
+
+		if (!this.isEnabled()) {
 			return
 		}
 
@@ -247,10 +255,14 @@ export class ManagedIndexer implements vscode.Disposable {
 
 					// Step 3: Fetch server manifest
 					try {
+						if (!this.config?.gptChatByApiKey) {
+							throw new Error("Missing required configuration for manifest fetch")
+						}
+
 						state.manifest = await getServerManifest(
 							projectId,
 							gitBranch,
-							this.config?.gptChatByApiKey || '',
+							this.config?.gptChatByApiKey,
 							state.currentAbortController?.signal,
 						)
 					} catch (error) {
@@ -271,7 +283,7 @@ export class ManagedIndexer implements vscode.Disposable {
 
 					// Step 4: Create git watcher
 					try {
-						const watcher = new GitWatcher({ cwd })
+						const watcher = new GitWatcher({ cwd, defaultBranchOverride: config.project?.baseBranch })
 						state.watcher = watcher
 						const ignoreController = new RooIgnoreController(cwd)
 						await ignoreController.initialize()
@@ -386,7 +398,7 @@ export class ManagedIndexer implements vscode.Disposable {
 				const manifest = await getServerManifest(
 					state.projectId,
 					branch,
-					this.config?.gptChatByApiKey || '',
+					this.config?.gptChatByApiKey,
 				)
 
 				state.manifest = manifest
@@ -542,6 +554,10 @@ export class ManagedIndexer implements vscode.Disposable {
 					// Check if operation was aborted
 					if (signal.aborted) {
 						throw new Error("AbortError")
+					}
+
+					if (this.isEnabled() === false) {
+						throw new Error("ManagedIndexing is not enabled")
 					}
 
 					if (file.type === "file-deleted") {
@@ -741,7 +757,7 @@ export class ManagedIndexer implements vscode.Disposable {
 			)
 
 			// Determine if this is the base branch
-			const defaultBranch = await getBaseBranch(state.workspaceFolder.uri.fsPath)
+			const defaultBranch = await state.watcher?.getDefaultBranch()
 			const isBaseBranch = state.gitBranch.toLowerCase() === defaultBranch.toLowerCase()
 
 			// Create a synthetic event to trigger file processing using GitWatcher's getFiles method
