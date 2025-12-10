@@ -1,5 +1,11 @@
 # kilo-code
 
+## 4.135.0
+
+### Minor Changes
+
+- [#4326](https://github.com/Kilo-Org/kilocode/pull/4326) [`6d62090`](https://github.com/Kilo-Org/kilocode/commit/6d620905dfc6d8419bdbc9ffcad54109057e709e) Thanks [@iscekic](https://github.com/iscekic)! - improve session sync mechanism (event based instead of timer)
+
 ## 4.134.0
 
 ### Minor Changes
